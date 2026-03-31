@@ -8,7 +8,7 @@
 
 set -e
 
-GITLAB_RAW="#{gitlab_raw_url}"
+GITLAB_RAW="https://raw.githubusercontent.com/hacktifytechnologies/Range1-VM4/main"
 LOG="/var/log/roundcube_lab_setup.log"
 exec > >(tee -a "$LOG") 2>&1
 
@@ -68,17 +68,68 @@ auth_mechanisms = plain login
 !include auth-system.conf.ext
 EOF
 
+# Full master.conf required by Dovecot 2.x on Ubuntu 22.04
+# NOTE: Postfix unix_listener removed — this lab uses Sendmail, postfix user does not exist
 cat > /etc/dovecot/conf.d/10-master.conf << 'EOF'
 service imap-login {
   inet_listener imap {
     port = 143
   }
+  inet_listener imaps {
+    port = 993
+    ssl = yes
+  }
 }
+
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+  inet_listener pop3s {
+    port = 995
+    ssl = yes
+  }
+}
+
+service lmtp {
+  unix_listener lmtp {
+    #mode = 0666
+  }
+}
+
+service imap {
+  #vsz_limit = $default_vsz_limit
+  #process_limit = 1024
+}
+
+service pop3 {
+  #process_limit = 1024
+}
+
+service submission-login {
+  inet_listener submission {
+    port = 587
+  }
+}
+
 service auth {
-  unix_listener /var/spool/postfix/private/auth {
-    mode = 0660
-    user = postfix
-    group = postfix
+  unix_listener auth-userdb {
+    #mode = 0600
+    #user =
+    #group =
+  }
+  #user = $default_internal_user
+}
+
+service auth-worker {
+  user = root
+}
+
+service dict {
+  unix_listener dict {
+    #mode = 0600
+    #user =
+    #group =
   }
 }
 EOF
@@ -103,8 +154,8 @@ rm -f /var/www/html/roundcubemail-*.tar.gz
 
 cd /var/www/html
 
-# Download from GitLab repo (offline-safe)
-echo "[5/7] Fetching tarball from GitLab..."
+# Download raw tarball directly from GitHub raw content URL
+echo "[5/7] Fetching tarball from GitHub..."
 wget -q "${GITLAB_RAW}/resources/roundcubemail-1.2.2-complete.tar.gz" \
   -O roundcubemail-1.2.2-complete.tar.gz
 
@@ -116,7 +167,7 @@ rm -f roundcubemail-1.2.2-complete.tar.gz
 mysql -u roundcube -proundcube123! roundcubedb < \
   /var/www/html/roundcube/SQL/mysql.initial.sql
 
-# Download config from GitLab
+# Download config from GitHub
 wget -q "${GITLAB_RAW}/configs/roundcube_config.inc.php" \
   -O /var/www/html/roundcube/config/config.inc.php
 
@@ -125,7 +176,7 @@ echo "[5/7] Done."
 # ── STEP 6: Configure Apache ──────────────────
 echo "[6/7] Configuring Apache..."
 
-# Download Apache vhost config from GitLab
+# Download Apache vhost config from GitHub
 wget -q "${GITLAB_RAW}/configs/roundcube_apache.conf" \
   -O /etc/apache2/sites-available/roundcube.conf
 
